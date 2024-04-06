@@ -59,20 +59,19 @@ fn process_git_object(o: &GitObject, hashes: &mut VecDeque<String>) {
 
 fn main() {
     println!("Pack File");
-    read_pack("C:/Dev/dapperdox/.git/objects/pack/pack-f65277212224c72a02c46da0f155678c266b82a6.pack");
+    read_pack("C:/Dev/Git2Json/.git/objects/pack/pack-07c4c5a79def263705060469408d2fad29a450e4.pack");
     
     println!("Idx File");
-    let idx_file = read_idx("C:/Dev/dapperdox/.git/objects/pack/pack-f65277212224c72a02c46da0f155678c266b82a6.idx");
-    println!("{:?}", idx_file);
+    let _idx_file = read_idx("C:/Dev/Git2Json/.git/objects/pack/pack-07c4c5a79def263705060469408d2fad29a450e4.idx");
+    //println!("{:?}", idx_file);
     
     println!("Git Objects");
 
-    let working_dir = "C:/Dev/dapperdox";
+    let working_dir = "C:/Dev/Git2Json";
     let head_commit = find_head_ref(working_dir);
     let head_content = head_commit.expect("Failed to read HEAD commit");
     println!("Starting with commit {:?}", head_content);
 
-    
     let mut object_hashes = VecDeque::new();
     object_hashes.push_back(head_content);
     
