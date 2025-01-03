@@ -1,111 +1,201 @@
 // http://shafiul.github.io/gitbook/7_the_packfile.html
 // https://dev.to/calebsander/git-internals-part-2-packfiles-1jg8
-use std::{fmt::Debug, fs::read, io::Read, str};
-
-use nom::{
-    bytes::streaming::take, combinator::map, error::ErrorKind, number::{complete::be_i32, streaming::be_u32}, IResult
-};
+use std::{collections::HashMap, fmt::Debug, io::{BufReader, Read, Seek}, str};
 
 use flate2::read::ZlibDecoder;
 
-fn parse_sha(input: &[u8]) -> IResult<&[u8], String> {
-    return map(
-        take(20usize), |h: &[u8]| String::from_iter(h.iter().map(|b| format!("{:02x?}", b)))
-    )(input)
+#[derive(Debug, PartialEq)]
+pub enum ObjectType {
+    Commit = 1,
+    Tree = 2,
+    Blob = 3,
+    Tag = 4,
+    OffsetDelta = 6,
+    ReferenceDelta = 7
 }
 
-fn read_object_header(input: &[u8]) -> (u8, usize, &[u8]) {
-    let mut read_next = (input[0] & 0b1000_0000) == 0b1000_0000;
-    println!("Read Next: {}", read_next);
-    
-    let object_type = (input[0] & 0b0111_0000) >> 4;
-    println!("Object Type: {:b}", object_type);
-
-    let mut length = u32::from_be_bytes([0,0,0, input[0] & 0b0000_1111]);
-    
-    let mut offset = 1;
-    while read_next {
-        let data = input[offset];
-        read_next = (data & 0b1000_0000) == 0b1000_0000;
-        let length_part = u32::from_be_bytes([0,0,0,data & 0b0111_1111]);
-        println!("Length: {:b}  Length Part: {:b}", length, length_part);
-
-        length = (length_part << (offset-1) * 7 + 4) | length;
-        offset += 1;
-    }
-
-    let mut output_stream = &input[offset..];
-
-    (object_type, length.try_into().unwrap(), &output_stream)
+#[derive(Clone, Debug, PartialEq)]
+pub enum RawGitObjectType {
+    Commit,
+    Tree,
+    Blob,
+    Tag,
+    OffetDelta(u64),
+    ReferenceDelta(String)
 }
 
-fn decompress_contents(content: &[u8], length: usize) -> (Vec<u8>, usize) {
+#[derive(Debug, PartialEq)]
+pub struct RawGitObject {
+    pub object_type: RawGitObjectType,
+    pub position: u64,
+    pub content: Vec<u8>
+}
+
+fn parse_sha<R: Read>(source: &mut R) -> Result<String, std::io::Error> {
+    let mut magic_bytes: [u8;20] = [0;20];
+    source.read_exact(&mut magic_bytes)?;
+    Ok(String::from_iter(magic_bytes.iter().map(|b| format!("{:02x?}", b))))
+}
+
+fn compute_git_hash(object_type: &RawGitObjectType, content: &[u8]) -> String {
+    let mut hasher = sha1_smol::Sha1::new();
+        
+    let object_prefix = 
+        match object_type {
+            RawGitObjectType::Blob => "blob",
+            RawGitObjectType::Commit => "commit",
+            RawGitObjectType::Tree => "tree",
+            RawGitObjectType::Tag => "tag",
+            _ => ""
+        };
+
+    hasher.update(format!("{} {}\0", object_prefix, content.len()).as_bytes());
+    hasher.update(&content);
+
+    hasher.hexdigest()
+}
+
+fn decode<R: Read + Seek>(content: &mut R, length: usize) -> Result<(Vec<u8>, u64), std::io::Error> { 
     let mut decoder = ZlibDecoder::new(content);
     
     let mut decompressed_contents = Vec::with_capacity(length);
     
-    let _ = decoder.read_to_end(&mut decompressed_contents);
-
-    (decompressed_contents, decoder.total_in().try_into().unwrap())
+    decoder.read_to_end(&mut decompressed_contents)?;
+    Ok((decompressed_contents, decoder.total_in()))
 }
 
-fn read_object_entry(input: &[u8]) -> &[u8] {
-    let (object_type, uncompressed_length, remainder) = read_object_header(input);
-    println!("Object Type: {:b}  Object Length: {}", object_type, uncompressed_length);
+fn decompress_contents<R: Read + Seek>(content: &mut R, length: usize) -> Result<Vec<u8>, std::io::Error> {
+    let start_position = content.stream_position()?;
+    let (decoded_content, read_bytes) = decode(content, length)?;
+    
+    content.seek(std::io::SeekFrom::Start(start_position + read_bytes))?;
+    Ok(decoded_content)
+}
 
-    if object_type == 7 {
-        let (remainder, sha) = parse_sha(remainder).expect("");
-        println!("Referenced Object: {}", sha);
-        let (_data, remainder) = remainder.split_at(uncompressed_length);
-        &remainder
+fn read_object_header<R: Read + Seek>(input: &mut R) -> (ObjectType, usize) {
+    let mut buf = [0];
+    input.read(&mut buf);
+    let mut read_next = (buf[0] & 0b1000_0000) == 0b1000_0000;
+    
+    let object_type = 
+        match (buf[0] & 0b0111_0000) >> 4 {
+            1 => ObjectType::Commit,
+            2 => ObjectType::Tree,
+            3 => ObjectType::Blob,
+            4 => ObjectType::Tag,
+            6 => ObjectType::OffsetDelta,
+            7 => ObjectType::ReferenceDelta,
+            _ => panic!("Invalid object type")
+        };
+
+    let mut length = u32::from_be_bytes([0,0,0, buf[0] & 0b0000_1111]);
+    println!("Starting length {}", length);
+    let mut offset = 1;
+    while read_next {
+        input.read(&mut buf);
+        println!("{}", buf[0]);
+        read_next = (buf[0] & 0b1000_0000) == 0b1000_0000;
+        let length_part = u32::from_be_bytes([0,0,0,buf[0] & 0b0111_1111]);
+        println!("lengthPart {}", length_part);
+
+        length = (length_part << (offset-1) * 7 + 4) | length;
+        println!("Inter length {}", length);
+        offset += 1;
     }
-    else if object_type == 6 {
-        let mut ref_offset = 0;
-        let mut read_next = true;
-        let mut offset = 0;
-        while read_next {
-            let data = remainder[offset];
-            read_next = (data & 0b1000_0000) == 0b1000_0000;
-            let ref_offset_part = i32::from_be_bytes([0,0,0,data & 0b0111_1111]);
-            println!("Offset: {:b}  Offset Part: {:b}", ref_offset, ref_offset_part);
 
-            ref_offset = (ref_offset << 7) | ref_offset_part;
-            offset += 1;
-            println!("Offset after: {:b}", ref_offset);
+    (object_type, length.try_into().unwrap())
+}
+
+fn read_object_entry<R: Read + Seek>(input: &mut R) -> Result<RawGitObject, std::io::Error> {
+    let position = input.stream_position()?;
+    let (object_type, uncompressed_length) = read_object_header(input);
+
+    match object_type {
+        ObjectType::ReferenceDelta => {
+            let sha = parse_sha(input)?;
+            Ok(RawGitObject { object_type: RawGitObjectType::ReferenceDelta(sha), position, content: vec![] })
+        },
+
+        ObjectType::OffsetDelta => {
+            let mut ref_offset = 0;
+            let mut read_next = true;
+            let mut buf = [0];
+            
+            // Each byte contributes 7 bits of data
+            const VARINT_ENCODING_BITS: u8 = 7;
+            // The upper bit indicates whether there are more bytes
+            const VARINT_CONTINUE_FLAG: u8 = 1 << VARINT_ENCODING_BITS;
+
+            while read_next {
+                input.read(&mut buf);
+    
+                read_next = (buf[0] & VARINT_CONTINUE_FLAG) != 0;
+                
+                ref_offset = (ref_offset << 7) | (buf[0] & 0b0111_1111) as u64;
+
+                if read_next {
+                    ref_offset += 1;
+                }
+            }
+    
+            let content = decompress_contents(input, uncompressed_length)?;
+    
+            Ok(RawGitObject { object_type: RawGitObjectType::OffetDelta(position.checked_sub(ref_offset).unwrap()), position, content })
+        },
+
+        _ => {
+            let content = decompress_contents(input, uncompressed_length)?;
+    
+            let object_type = 
+                match object_type {
+                    ObjectType::Blob => RawGitObjectType::Blob,
+                    ObjectType::Commit => RawGitObjectType::Commit,
+                    ObjectType::Tag => RawGitObjectType::Tag,
+                    ObjectType::Tree => RawGitObjectType::Tree,
+                    _ => panic!("Unknown object type")
+                };
+            
+            Ok(RawGitObject { object_type, position, content })
         }
-        println!("Offset: {}", ref_offset);
-
-        let remaining_bytes = &remainder[offset..];
-        let (content, read_bytes) = decompress_contents(remaining_bytes, uncompressed_length);
-        println!("Ref content: {:?}", content);
-
-        &remaining_bytes[read_bytes..]
-    } else {
-        let (decompressed_contents, rl) = decompress_contents(remainder, uncompressed_length);
-    
-        let body = String::from_utf8_lossy(&decompressed_contents);
-        println!("Contents: {:?}", body);
-    
-        &remainder[rl..]
     }
 }
 
-pub fn read_pack(path: &str) {
-    //C:\Dev\dapperdox\.git\objects\pack
-    let contents = std::fs::read(path).expect("");
-    let (prelude, remainder) = contents.split_at(4);
-    println!("PACK: {:?}", str::from_utf8(prelude));
+pub fn read_packfile(path: &str) -> Result<(),std::io::Error> {
+    // Read the contents of the pack file
+    let raw_stream = std::fs::File::open(path)?;
+    let mut pack_stream = BufReader::new(raw_stream);
 
-    let (version, remainder) = remainder.split_at(4);
-    println!("Version: {:?}", version);
+    // Read PACK
+    let mut byte_buffer = [0,0,0,0];
+    pack_stream.read_exact(&mut byte_buffer)?;
+    println!("PACK: {:?}", str::from_utf8(&byte_buffer));
 
-    let count_result = be_u32::<_, (_, ErrorKind)>(remainder);
-    let (remainder, count) = count_result.expect("Count");
-    println!("Object Count: {:?}", count);
+    // Read the packfile version
+    pack_stream.read_exact(&mut byte_buffer)?;
+    println!("Version: {:?}", byte_buffer);
 
-    let mut remainder = remainder;
+    // Read the number of objects that will appear in the packfile
+    pack_stream.read_exact(&mut byte_buffer)?;
+    let object_count = u32::from_be_bytes(byte_buffer);
+    println!("Object Count: {:?}", object_count);
 
-    for _ in 0..count {
-        remainder = read_object_entry(remainder);
+    let mut hash_positions:  HashMap<String, u64> = HashMap::new();
+
+    // Loop over object_count objects
+    for _ in 0..object_count {
+        let RawGitObject { object_type, position, content } = read_object_entry(&mut pack_stream)?;
+
+        let object_hash = compute_git_hash(&object_type, &content);
+
+        println!("Type: {:?}  Position: {} Hash: {}", object_type, position, object_hash);
+        
+        if object_type == RawGitObjectType::Commit {
+            println!("Content");
+            String::from_utf8(content).expect("").split("\\n").for_each(|l| { println!("{}", l); })
+        }
+        hash_positions.insert(object_hash, position);
     }
+
+    println!("{:?}", hash_positions);
+    Ok(())
 }
